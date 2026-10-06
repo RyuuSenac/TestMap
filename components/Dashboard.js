@@ -1,124 +1,434 @@
 'use client';
-import { useEffect, useRef, useState } from 'react';
+
+import { useEffect, useMemo, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
-import { ArrowUpRight, ArrowRight, Bell, BusFront, Check, ChevronRight, Clock3, Copy, GraduationCap, LayoutDashboard, LogOut, MapPin, Menu, Navigation, Plus, Radio, Route, ShieldCheck, Sparkles, Trash2, Users, X, CircleHelp, LoaderCircle, Leaf, Link2 } from 'lucide-react';
+import {
+  AlertTriangle,
+  BusFront,
+  Clock3,
+  Crosshair,
+  Gauge,
+  LoaderCircle,
+  LocateFixed,
+  MapPin,
+  Navigation,
+  RefreshCw,
+  Route,
+  ShieldCheck,
+  Smartphone,
+  Square,
+} from 'lucide-react';
 import AddressField from './AddressField';
-import Modal from './Modal';
-import { DEMO_PATH, DEMO_STOPS, DEMO_DURATION, simulationAt, validChild, validPoint } from '../lib/demo.mjs';
-const RouteMap = dynamic(()=>import('./RouteMap'), { ssr:false, loading:()=> <div className="map-loading"><LoaderCircle className="spin"/>Preparando seu mapa…</div> });
-const STORAGE = 'lumio-preview-v1';
-const point = (index) => ({ address: DEMO_STOPS[index].address, lat: DEMO_STOPS[index].lat, lng: DEMO_STOPS[index].lng });
-function exampleChildren() { return [
-  { id:'demo-1',name:'Sofia Martins',age:'8',shift:'Manhã',home:point(1),school:{...point(3),name:'Escola demonstrativa'},example:true },
-  { id:'demo-2',name:'Lucas Oliveira',age:'10',shift:'Manhã',home:point(2),school:{...point(3),name:'Escola demonstrativa'},example:true }
-]; }
-function initials(name) { return name.split(' ').filter(Boolean).slice(0,2).map(x=>x[0]).join('').toUpperCase(); }
-function formatTime(seconds) { return `${Math.floor(seconds/60).toString().padStart(2,'0')}:${(seconds%60).toString().padStart(2,'0')}`; }
+import { validPoint } from '../lib/demo.mjs';
+
+const RouteMap = dynamic(() => import('./RouteMap'), {
+  ssr: false,
+  loading: () => (
+    <div className="map-loading">
+      <LoaderCircle className="spin" />
+      Preparando mapa
+    </div>
+  ),
+});
+
+const STORAGE_KEY = 'lumio-live-route-v2';
+
+function formatDistance(meters = 0) {
+  if (!Number.isFinite(meters)) return '0 m';
+  if (meters < 1000) return `${Math.max(0, Math.round(meters))} m`;
+  return `${(meters / 1000).toFixed(meters >= 10000 ? 0 : 1)} km`;
+}
+
+function formatDuration(seconds = 0) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '0 min';
+  const minutes = Math.max(1, Math.round(seconds / 60));
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `${hours} h ${rest} min` : `${hours} h`;
+}
+
+function haversine(a, b) {
+  if (!a || !b) return Infinity;
+  const toRad = value => (value * Math.PI) / 180;
+  const earth = 6371000;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * earth * Math.asin(Math.sqrt(h));
+}
+
+function locateOnRoute(position, path) {
+  if (!position || !Array.isArray(path) || path.length < 2) {
+    return { progress: 0, distance: Infinity, index: 0 };
+  }
+
+  let bestDistance = Infinity;
+  let bestIndex = 0;
+  for (let index = 0; index < path.length; index += 1) {
+    const point = { lat: path[index][0], lng: path[index][1] };
+    const distance = haversine(position, point);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  }
+
+  return {
+    progress: bestIndex / Math.max(1, path.length - 1),
+    distance: bestDistance,
+    index: bestIndex,
+  };
+}
+
+function getGeoMessage(error) {
+  if (error?.code === 1) return 'A permissão de localização foi negada. Libere o acesso nas configurações do navegador.';
+  if (error?.code === 2) return 'O dispositivo não conseguiu determinar sua localização agora.';
+  if (error?.code === 3) return 'A localização demorou demais para responder. Tente novamente em uma área com melhor sinal.';
+  return 'Não foi possível acessar a localização deste dispositivo.';
+}
 
 export default function Dashboard({ publicView = false }) {
-  const routeRevision = useRef(0);
-  const [tab,setTab] = useState('overview'), [children,setChildren] = useState([]), [user,setUser] = useState(''), [loaded,setLoaded] = useState(false);
-  const [mobileMenu,setMobileMenu] = useState(false), [modal,setModal] = useState(null), [notice,setNotice] = useState(null);
-  const [clock,setClock] = useState(null), [offset,setOffset] = useState(0), [synced,setSynced] = useState(false);
-  const [departure,setDeparture] = useState(point(0)), [customRoute,setCustomRoute] = useState(null), [routeBusy,setRouteBusy] = useState(false), [privatePreview,setPrivatePreview] = useState(false), [privateStart,setPrivateStart] = useState(null);
-  const [name,setName] = useState(''), [age,setAge] = useState(''), [shift,setShift] = useState('Manhã'), [home,setHome] = useState(null), [school,setSchool] = useState(null), [schoolName,setSchoolName] = useState(''), [consent,setConsent] = useState(false);
-  const [formError,setFormError] = useState(''), [loginName,setLoginName] = useState('');
-  function notify(message, type = 'success') { setNotice({ message,type }); }
-  useEffect(()=> {
-    if (publicView) return;
+  const watchId = useRef(null);
+  const [origin, setOrigin] = useState(null);
+  const [destination, setDestination] = useState(null);
+  const [routeData, setRouteData] = useState(null);
+  const [routeBusy, setRouteBusy] = useState(false);
+  const [tracking, setTracking] = useState(false);
+  const [position, setPosition] = useState(null);
+  const [accuracy, setAccuracy] = useState(null);
+  const [speed, setSpeed] = useState(null);
+  const [heading, setHeading] = useState(null);
+  const [lastFix, setLastFix] = useState(null);
+  const [geoError, setGeoError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [follow, setFollow] = useState(true);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
     try {
-      const saved = JSON.parse(localStorage.getItem(STORAGE) || 'null');
-      if (saved && Array.isArray(saved.children)) {
-        setChildren(saved.children.filter(validChild).slice(0,12));
-        if (typeof saved.user === 'string') setUser(saved.user.slice(0,80));
-        if (validPoint(saved.departure)) setDeparture(saved.departure);
-      } else setChildren(exampleChildren());
-    } catch { setChildren(exampleChildren()); notify('Não foi possível ler os cadastros locais. A prévia carregou os exemplos.', 'error'); }
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+      if (saved && validPoint(saved.origin)) setOrigin(saved.origin);
+      if (saved && validPoint(saved.destination)) setDestination(saved.destination);
+    } catch {
+      // Ignora dados locais antigos ou corrompidos.
+    }
     setLoaded(true);
-  }, [publicView]);
-  useEffect(()=> {
-    if (!loaded || publicView) return;
-    try { localStorage.setItem(STORAGE, JSON.stringify({ children,user,departure })); }
-    catch { notify('O navegador não permitiu salvar. Mantenha esta página aberta para não perder os cadastros.', 'error'); }
-  }, [children,user,departure,loaded,publicView]);
-  useEffect(()=> {
-    let disposed = false;
-    const sync = async()=> {
-      const before = Date.now();
-      try {
-        const response = await fetch('/api/demo', { cache:'no-store' });
-        if (!response.ok) throw new Error('sync');
-        const data = await response.json();
-        if (disposed) return;
-        setOffset(data.serverTime - (before+Date.now())/2); setSynced(true);
-      } catch { if (!disposed) setSynced(false); }
-    };
-    sync(); const timer = setInterval(sync,30000);
-    setClock(Date.now()); const ticker = setInterval(()=>setClock(Date.now()),1000);
-    return ()=> { disposed = true; clearInterval(timer); clearInterval(ticker); };
   }, []);
-  useEffect(()=> { if (!notice) return; const timer=setTimeout(()=>setNotice(null),7000); return ()=>clearTimeout(timer); }, [notice]);
-  useEffect(()=> { routeRevision.current++; setCustomRoute(null); setPrivatePreview(false); setPrivateStart(null); }, [children,departure]);
-  const custom = privatePreview && customRoute;
-  const activePath = custom ? customRoute.path : DEMO_PATH;
-  const activeStops = custom ? customRoute.stops : DEMO_STOPS;
-  const sim = simulationAt(custom ? (privateStart===null ? 0 : (clock||Date.now())-privateStart) : (clock||0)+offset, activePath, DEMO_DURATION);
-  const progress = clock===null ? 0 : sim.progress;
-  const boarded = custom ? Math.min(children.length,Math.floor(progress*children.length*1.7)) : (progress >= 11/18 ? 2 : progress >= 5/18 ? 1 : 0);
-  const liveUrl = typeof window !== 'undefined' ? `${window.location.origin}/ao-vivo` : '/ao-vivo';
-  async function share() {
-    try { await navigator.clipboard.writeText(liveUrl); notify('Link da rota pública copiado. Abra em outro dispositivo para acompanhar.'); }
-    catch { setModal('share'); }
-  }
-  function openChild() {
-    if (children.length >=12) { notify('A prévia aceita até 12 crianças por navegador.', 'error'); return; }
-    setName('');setAge('');setShift('Manhã');setHome(null);setSchool(null);setSchoolName('');setConsent(false);setFormError('');setModal('child');
-  }
-  function saveChild(e) {
-    e.preventDefault();
-    if (!home || !school) { setFormError('Localize e confirme o endereço de embarque e o endereço da escola.'); return; }
-    if (!consent) { setFormError('Confirme o uso de dados fictícios para continuar.'); return; }
-    const child = { id:crypto.randomUUID(),name:name.trim(),age,shift,home,school:{...school,name:schoolName.trim()},example:false };
-    if (!validChild(child)) { setFormError('Confira o nome e os endereços selecionados.'); return; }
-    setChildren(previous=>[...previous,child]);setModal(null);notify(`${child.name} foi cadastrado na sua prévia.`);
-  }
-  async function calculateRoute() {
-    if (!departure) { notify('Confirme o ponto de partida no mapa.', 'error'); return; }
-    if (!children.length) { notify('Cadastre pelo menos uma criança antes de calcular.', 'error'); return; }
-    setRouteBusy(true);
-    const revision = routeRevision.current;
-    const schoolPoints = children.map(child=>child.school).filter((p,i,all)=>all.findIndex(other=>other.lat===p.lat&&other.lng===p.lng)===i);
-    const stops = [{...departure,name:'Ponto de partida'}, ...children.map((child,i)=>({...child.home,name:`Embarque ${i+1} · ${child.name}`})), ...schoolPoints.map(p=>({...p,name:p.name||'Escola'}))];
+
+  useEffect(() => {
+    if (!loaded) return;
     try {
-      const res = await fetch('/api/route', { method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({points:stops}) });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
-      if (revision !== routeRevision.current) { notify('Os endereços mudaram durante o cálculo. Calcule a rota novamente.', 'error'); return; }
-      setCustomRoute({...data,stops}); setPrivatePreview(true);setPrivateStart(null);
-      notify('Rota calculada. Você pode simular o trajeto neste navegador.');
-    } catch(err) { notify(err.message || 'Não foi possível calcular a rota.', 'error'); }
-    finally { setRouteBusy(false); }
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ origin, destination }));
+    } catch {
+      // O app continua funcionando sem persistência local.
+    }
+  }, [origin, destination, loaded]);
+
+  useEffect(() => {
+    setRouteData(null);
+    setNotice('');
+  }, [origin?.lat, origin?.lng, destination?.lat, destination?.lng]);
+
+  useEffect(() => {
+    return () => {
+      if (watchId.current !== null && navigator.geolocation) {
+        navigator.geolocation.clearWatch(watchId.current);
+      }
+    };
+  }, []);
+
+  const routeMatch = useMemo(
+    () => locateOnRoute(position, routeData?.path),
+    [position, routeData?.path]
+  );
+
+  const remainingDistance = useMemo(() => {
+    if (!routeData) return 0;
+    return routeData.distance * (1 - routeMatch.progress);
+  }, [routeData, routeMatch.progress]);
+
+  const remainingDuration = useMemo(() => {
+    if (!routeData) return 0;
+    return routeData.duration * (1 - routeMatch.progress);
+  }, [routeData, routeMatch.progress]);
+
+  const destinationDistance = useMemo(() => {
+    if (!position || !destination) return null;
+    return haversine(position, destination);
+  }, [position, destination]);
+
+  const offRoute = Boolean(
+    tracking &&
+      routeData &&
+      Number.isFinite(routeMatch.distance) &&
+      routeMatch.distance > Math.max(120, (accuracy || 0) * 2)
+  );
+
+  const routeStops = useMemo(() => {
+    const stops = [];
+    if (origin) stops.push({ ...origin, name: 'Origem' });
+    if (destination) stops.push({ ...destination, name: 'Destino' });
+    return stops;
+  }, [origin, destination]);
+
+  async function requestRoute(points, successMessage) {
+    setRouteBusy(true);
+    setNotice('');
+    try {
+      const response = await fetch('/api/route', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ points }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Não foi possível calcular a rota.');
+      setRouteData(data);
+      setNotice(successMessage);
+      return true;
+    } catch (error) {
+      setNotice(error.message || 'Não foi possível calcular a rota.');
+      return false;
+    } finally {
+      setRouteBusy(false);
+    }
   }
-  function selectTab(next) { setTab(next);setMobileMenu(false); }
-  const title = publicView ? 'Um trajeto para acompanhar, juntos.' : tab==='children' ? 'Pequenos passageiros, grandes cuidados.' : tab==='routes' ? 'Uma boa viagem começa aqui.' : 'Cada trajeto, mais tranquilo.';
-  return <div className={`app-shell ${publicView?'public-shell':''}`}>
-    {!publicView && <aside className={`sidebar ${mobileMenu?'open':''}`}><a href="/" className="brand"><span className="brand-icon"><BusFront size={23}/></span>lumio<span className="brand-dot">.</span></a><button className="sidebar-close icon-button" onClick={()=>setMobileMenu(false)} aria-label="Fechar menu"><X/></button><div className="workspace-label">SEU ESPAÇO</div><nav aria-label="Navegação principal">{[['overview',LayoutDashboard,'Visão geral'],['children',Users,'Crianças'],['routes',Route,'Planejar rota']].map(([key,Icon,label])=><button key={key} className={tab===key?'nav-item active':'nav-item'} onClick={()=>selectTab(key)}><Icon size={19}/><span>{label}</span>{key==='children'&&<span className="nav-count">{children.length}</span>}</button>)}<a href="/ao-vivo" className="nav-item"><Radio size={19}/><span>Rota pública ao vivo</span><ArrowUpRight size={15}/></a></nav><div className="sidebar-note"><div className="note-icon"><Sparkles size={21}/></div><strong>O futuro vem a bordo.</strong><p>Uma prévia do transporte escolar mais conectado.</p><span className="version">LUMIO · VERSÃO DEMO</span></div><button className="sidebar-help" onClick={()=>setModal('about')}><CircleHelp size={18}/>Conheça esta prévia<ArrowUpRight size={15}/></button><div className="sidebar-footer"><span className="avatar small">{initials(user||'Conta Demo')}</span><div><strong>{user||'Conta de demonstração'}</strong><span>Acesso local gratuito</span></div><button className="icon-button" aria-label={user?'Sair do acesso demonstrativo':'Acessar demonstração'} onClick={()=>{ if(user){setUser('');notify('Acesso demonstrativo encerrado. Seus cadastros locais foram mantidos.');}else setModal('login'); }}><LogOut size={17}/></button></div></aside>}
-    <div className="main-shell"><header className="topbar"><div className="breadcrumb">{publicView?<a href="/" className="brand public-brand"><span className="brand-icon"><BusFront size={21}/></span>lumio<span className="brand-dot">.</span></a>:<><button className="icon-button mobile-menu" aria-label="Abrir menu" onClick={()=>setMobileMenu(true)}><Menu/></button><span>Painel do responsável</span><ChevronRight size={14}/><strong>{tab==='overview'?'Visão geral':tab==='children'?'Crianças':'Planejar rota'}</strong></>}</div><div className="topbar-actions"><span className="demo-pill"><span/>Prévia do projeto</span>{publicView?<a className="btn subtle" href="/">Acessar painel<ArrowUpRight size={15}/></a>:<><button className="notification-button icon-button" aria-label="Informações da demonstração" onClick={()=>setModal('about')}><Bell size={20}/><i/></button><button className="avatar" aria-label="Meu acesso demonstrativo" onClick={()=>{setLoginName(user);setModal('login');}}>{initials(user||'Conta Demo')}</button></>}</div></header>
-    <main><div className="page-heading"><div><div className="eyebrow"><span/>{publicView?'ACOMPANHAMENTO COMPARTILHADO':'BEM-VINDO AO LUMIO'}</div><h1>{title}</h1><p>{publicView?'A mesma van, no mesmo momento, em qualquer dispositivo.':tab==='children'?'Organize os embarques e as escolas em um só lugar.':tab==='routes'?'Defina a saída, confira os embarques e encontre o caminho.':'Mais cuidado para quem vai. Mais tranquilidade para quem fica.'}</p></div>{!publicView&&<button className="btn primary" onClick={openChild}><Plus size={18}/>Cadastrar criança</button>}{publicView&&<button className="btn primary" onClick={share}><Link2 size={17}/>Compartilhar rota</button>}</div>
-    <div className="preview-banner"><span className="banner-symbol"><Sparkles size={17}/></span><p><strong>Você está em uma demonstração.</strong> {publicView?'A van e as paradas são fictícias. Nenhuma localização real é transmitida.':'Use dados fictícios. Os cadastros ficam apenas neste navegador.'}</p><button onClick={()=>setModal('about')}>Saiba mais<ArrowRight size={14}/></button></div>
-    {(publicView||tab==='overview')&&<><div className="stats-grid"><Stat icon={BusFront} title="Viagem demonstrativa" value="Em movimento" detail="Simulação automática de 4 minutos" color="green"/><Stat icon={Users} title={publicView?'Embarques de exemplo':'Crianças cadastradas'} value={publicView?'2':String(children.length).padStart(2,'0')} detail={publicView?'Passageiros fictícios':`${children.filter(c=>c.shift==='Manhã').length} no turno da manhã`} color="blue"/><Stat icon={Route} title="Trajeto demonstrativo" value="4 paradas" detail="Saída, 2 embarques e escola" color="orange"/><Stat icon={ShieldCheck} title="Acompanhamento" value={synced?'Sincronizado':'Conectando'} detail={synced?'Horário alinhado com o servidor':'Usando relógio local até reconectar'} color="purple"/></div><section className="live-layout"><div className="card live-card"><div className="card-heading"><div><div className="section-eyebrow">UM OLHAR NO CAMINHO</div><h2>Rota demonstrativa ao vivo <span className="live-badge"><span/>AO VIVO</span></h2><p>Jardim Paulista, São Paulo · Trajeto ilustrativo</p></div><button className="icon-button" aria-label="Copiar link da rota pública" onClick={share}><Link2 size={19}/></button></div><div className="map-container"><RouteMap path={DEMO_PATH} stops={DEMO_STOPS} position={sim.position} mapId="public-demo"/><div className="map-status"><span className="pulse-dot"/><div><strong>Van Lumio · Demonstração</strong><span>Posição simulada{synced?' · sincronizada':' · relógio local'}</span></div><span className="sim-tag">SIMULAÇÃO</span></div><div className="map-legend"><span><i className="legend-route"/>Trajeto ilustrativo</span><span><i className="legend-stop"/>Ponto de parada</span></div></div><div className="map-footer"><div><span className="vehicle-icon"><BusFront size={22}/></span><div><strong>Uma viagem, muitos olhares.</strong><p>Abra o link em outro dispositivo para acompanhar.</p></div></div><button className="text-button" onClick={share}>Compartilhar<ArrowUpRight size={16}/></button></div></div><div className="card journey-card"><div className="card-heading"><div><div className="section-eyebrow">PASSO A PASSO</div><h2>O caminho de hoje</h2></div><span className="icon-muted"><Route size={20}/></span></div><div className="journey-summary"><div><span>Próxima parada</span><strong>{DEMO_STOPS[sim.nextStop].name}</strong></div><span className="eta"><Clock3 size={15}/>{formatTime(sim.remaining)}</span></div><ol className="timeline">{DEMO_STOPS.map((stop,index)=>{const reached=index===0||progress>=([0,5/18,11/18,1][index]);return <li key={stop.name} className={reached?'reached':''}><span className="timeline-dot">{reached?<Check size={13}/>:index===3?<GraduationCap size={15}/>:index+1}</span><div><strong>{stop.name}</strong><p>{stop.address.split(' · ')[0]}</p><span className={`stop-status ${reached?'done':''}`}>{index===0?'Partida da simulação':reached?'Parada percorrida':index===sim.nextStop?'A caminho':'Próxima no trajeto'}</span></div></li>;})}</ol><div className="journey-progress"><div><span>Progresso da viagem</span><strong>{Math.round(progress*100)}%</strong></div><div className="progress-track"><i style={{width:`${progress*100}%`}}/></div><p>O trajeto reinicia automaticamente a cada 4 minutos.</p></div></div></section>
-    <div className="bottom-grid"><section className="card passenger-card"><div className="card-heading"><div><h2>{publicView?'Como funciona o Lumio':'Seus pequenos passageiros'}</h2><p>{publicView?'Cuidado e informação em cada etapa.':'O cuidado começa antes do embarque.'}</p></div>{!publicView&&<button className="text-button" onClick={()=>selectTab('children')}>Ver todos<ArrowRight size={15}/></button>}</div>{publicView?<div className="public-features"><div><MapPin/><strong>Planeje o caminho</strong><p>Saída, embarques e escolas em uma rota.</p></div><div><Radio/><strong>Acompanhe a viagem</strong><p>Uma prévia sincronizada entre dispositivos.</p></div><div><ShieldCheck/><strong>Cuide dos dados</strong><p>A rota pública usa somente informações fictícias.</p></div></div>:children.length?<div className="passenger-list">{children.slice(0,3).map((child,index)=><div className="passenger-row" key={child.id}><span className={`child-avatar color-${index%3}`}>{initials(child.name)}</span><div><strong>{child.name}</strong><p>{child.school.name||'Escola cadastrada'} · {child.shift}</p></div><span className="neutral-badge">{child.example?'Exemplo':'Cadastro local'}</span></div>)}</div>:<div className="empty-state"><Users/><p>Nenhuma criança cadastrada.</p><button className="text-button" onClick={openChild}>Adicionar a primeira<Plus size={15}/></button></div>}</section><section className="care-card"><span className="care-art"><ShieldCheck size={44}/><i/><b/></span><div className="section-eyebrow">FEITO PARA CUIDAR</div><h2>Tranquilidade também<br/>faz parte do trajeto.</h2><p>Embarques organizados, caminhos claros e quem você ama sempre no centro.</p><button className="text-button" onClick={()=>setModal('about')}>Conheça o projeto<ArrowUpRight size={16}/></button></section></div></>}
-    {!publicView&&tab==='children'&&<><div className="section-toolbar"><div><h2>Crianças cadastradas <span className="count-label">{children.length}</span></h2><p>Até 12 crianças nesta prévia · Armazenamento local</p></div><button className="btn subtle" onClick={()=>setModal('reset')}>Carregar exemplos<Sparkles size={15}/></button></div><div className="children-grid">{children.map((child,index)=><article className="card child-card" key={child.id}><div className="child-card-top"><span className={`child-avatar large color-${index%3}`}>{initials(child.name)}</span><button className="icon-button danger" aria-label={`Remover ${child.name}`} onClick={()=>setModal({remove:child})}><Trash2 size={17}/></button></div><h2>{child.name}</h2><p>{child.age?`${child.age} anos · `:''}{child.shift}<span className="neutral-badge">{child.example?'Exemplo':'Local'}</span></p><div className="child-address"><MapPin size={17}/><div><span>Ponto de embarque</span><p>{child.home.address}</p></div></div><div className="child-address"><GraduationCap size={17}/><div><span>{child.school.name||'Escola'}</span><p>{child.school.address}</p></div></div><div className="child-card-footer"><ShieldCheck size={14}/>Visível apenas neste navegador</div></article>)}<button className="add-child-card" onClick={openChild}><span><Plus size={24}/></span><strong>Cadastrar criança</strong><p>Um novo passageiro para cuidar.</p></button></div></>}
-    {!publicView&&tab==='routes'&&<div className="planner-layout"><section className="card planner-form"><div className="card-heading"><div className="section-eyebrow">MONTE SEU TRAJETO</div><h2>Planejar uma rota</h2><p>Os embarques seguem a ordem dos cadastros, depois as escolas.</p></div><div className="planner-body"><AddressField key="departure" label="Ponto de partida" value={departure} onChange={setDeparture} allowGps/><h3><Users size={17}/>Embarques e destinos</h3>{children.length?children.map((child,i)=><div className="planner-stop" key={child.id}><span>{i+1}</span><div><strong>{child.name}</strong><p>{child.home.address}</p><small><GraduationCap size={13}/>{child.school.name||'Escola'} · {child.shift}</small></div></div>):<p className="muted">Cadastre uma criança para incluir endereços de embarque e escola.</p>}<button className="text-button" onClick={openChild}><Plus size={15}/>Adicionar criança</button><div className="planner-info"><CircleHelp size={17}/><p>OSRM calcula um percurso por ruas, sem trânsito em tempo real. A prévia não otimiza a ordem dos embarques.</p></div><button className="btn primary full-width" disabled={routeBusy||!children.length||!departure} onClick={calculateRoute}>{routeBusy?<LoaderCircle className="spin" size={17}/>:<Route size={17}/>} {routeBusy?'Calculando percurso…':'Calcular minha rota'}</button></div></section><section className="card planned-map"><div className="card-heading"><div><h2>{custom?'Sua rota de teste':'Veja o caminho no mapa'}</h2><p>{custom?'Rota privada · Apenas neste navegador':'Calcule seus endereços ou acompanhe a demonstração.'}</p></div><span className="neutral-badge">{custom?'PRIVADA':'EXEMPLO'}</span></div><RouteMap path={activePath} stops={activeStops} position={sim.position} mapId={custom?'custom':'demo'}/>{custom?<div className="route-result"><div><strong>{(customRoute.distance/1000).toFixed(1)} km</strong><span>Distância estimada</span></div><div><strong>{Math.ceil(customRoute.duration/60)} min</strong><span>Tempo sem trânsito</span></div><button className="btn primary" onClick={()=>setPrivateStart(privateStart===null?Date.now():null)}>{privateStart===null?<Navigation size={16}/>:<X size={16}/>} {privateStart===null?'Simular trajeto':'Reiniciar prévia'}</button></div>:<div className="map-footer"><p><Leaf size={16}/>Uma rota mais clara. Um dia mais leve.</p><a className="text-button" href="/ao-vivo">Ver rota pública<ArrowUpRight size={16}/></a></div>}<p className="private-note">Sua rota cadastrada não aparece na página pública. A página ao vivo mantém o percurso fictício compartilhado.</p></section></div>}
-    <footer className="page-footer"><span>lumio<span className="brand-dot">.</span><span className="footer-tagline">Cuidado em movimento.</span></span><span>Prévia funcional · Dados fictícios · {publicView?'Simulação compartilhada':'Cadastros locais'}</span></footer>
-    </main></div>
-    {notice&&<div className={`toast ${notice.type}`} role={notice.type==='error'?'alert':'status'}>{notice.type==='error'?<CircleHelp size={19}/>:<Check size={19}/>}<span>{notice.message}</span><button className="icon-button" onClick={()=>setNotice(null)} aria-label="Dispensar mensagem"><X size={17}/></button></div>}
-    {modal==='child'&&<Modal title="Um novo passageiro" subtitle="Cadastre uma criança fictícia para testar o Lumio." onClose={()=>setModal(null)}><form onSubmit={saveChild} className="child-form"><div className="form-row"><label className="grow">Nome da criança<input required maxLength={80} value={name} onChange={e=>setName(e.target.value)} placeholder="Ex.: Marina Costa"/></label><label className="age-input">Idade<input type="number" min="1" max="18" value={age} onChange={e=>setAge(e.target.value)} placeholder="8"/></label><label>Turno<select value={shift} onChange={e=>setShift(e.target.value)}><option>Manhã</option><option>Tarde</option><option>Integral</option></select></label></div><AddressField label="Endereço de embarque" value={home} onChange={setHome}/><label>Nome da escola<input required maxLength={100} value={schoolName} onChange={e=>setSchoolName(e.target.value)} placeholder="Ex.: Escola Jardim"/></label><AddressField label="Endereço da escola" value={school} onChange={setSchool}/><label className="checkbox-label"><input type="checkbox" checked={consent} onChange={e=>setConsent(e.target.checked)}/><span>Estou usando dados fictícios. Entendo que esta prévia não oferece autenticação nem proteção para dados reais de crianças.</span></label>{formError&&<p className="field-error" role="alert">{formError}</p>}<div className="modal-actions"><button type="button" className="btn subtle" onClick={()=>setModal(null)}>Cancelar</button><button className="btn primary" type="submit"><Plus size={17}/>Cadastrar criança</button></div></form></Modal>}
-    {modal==='login'&&<Modal title="Seu espaço no Lumio" subtitle="Acesse a demonstração sem criar uma conta." onClose={()=>setModal(null)}><form onSubmit={e=>{e.preventDefault();setUser(loginName.trim());setModal(null);notify('Seu acesso demonstrativo está ativo neste navegador.');}}><label>Como podemos chamar você?<input required autoComplete="given-name" maxLength={80} value={loginName} onChange={e=>setLoginName(e.target.value)} placeholder="Seu nome ou apelido"/></label><div className="planner-info"><ShieldCheck size={20}/><p>Este é um acesso demonstrativo local, sem senha. Não é uma conta autenticada e não deve ser usado para dados reais.</p></div><button className="btn primary full-width" type="submit">Entrar na prévia<ArrowRight size={17}/></button></form></Modal>}
-    {modal==='about'&&<Modal title="Conheça a prévia do Lumio" subtitle="Um primeiro passo para o cuidado em movimento." onClose={()=>setModal(null)}><div className="about-content"><p>Esta versão explora três partes do projeto: cadastro de crianças e escolas, planejamento do trajeto e acompanhamento de uma van demonstrativa.</p><h3>O que você pode experimentar</h3><ul><li>Cadastrar várias crianças fictícias com endereços e escolas.</li><li>Preencher endereços com ViaCEP e confirmar pontos no mapa.</li><li>Usar sua posição como saída, com permissão do navegador.</li><li>Calcular um trajeto com OSRM e simular a viagem localmente.</li><li>Abrir a rota pública em vários dispositivos e ver a mesma simulação, sincronizada pelo servidor.</li></ul><h3>Antes de usar dados reais</h3><p>Cadastros ficam no armazenamento do navegador. Login seguro, banco de dados, permissões, localização real compartilhada, contratos e pagamentos são etapas futuras. A simulação pública não transmite dados dos seus cadastros.</p><p className="muted">Mapas: OpenStreetMap + Leaflet · Endereços: ViaCEP + Photon · Rotas: OSRM. Serviços públicos gratuitos têm limites e não garantem disponibilidade.</p><a className="btn subtle" href="/ao-vivo">Abrir rota pública<ArrowUpRight size={16}/></a></div></Modal>}
-    {modal==='share'&&<Modal title="Compartilhar a demonstração" onClose={()=>setModal(null)}><p className="muted">Copie este endereço e abra em outro dispositivo.</p><input readOnly value={liveUrl} onFocus={e=>e.target.select()} aria-label="Link da rota pública"/><a className="btn primary share-link" href="/ao-vivo">Abrir rota pública<ArrowUpRight size={16}/></a></Modal>}
-    {modal==='reset'&&<Modal title="Carregar dados de exemplo?" onClose={()=>setModal(null)}><p className="muted">Isso substitui os cadastros deste navegador por duas crianças fictícias e restaura a saída de exemplo.</p><div className="modal-actions"><button className="btn subtle" onClick={()=>setModal(null)}>Cancelar</button><button className="btn primary" onClick={()=>{setChildren(exampleChildren());setDeparture(point(0));setModal(null);notify('Dados fictícios carregados.');}}>Carregar exemplos</button></div></Modal>}
-    {modal?.remove&&<Modal title="Remover este cadastro?" onClose={()=>setModal(null)}><p className="muted">O cadastro de {modal.remove.name} será removido deste navegador.</p><div className="modal-actions"><button className="btn subtle" onClick={()=>setModal(null)}>Cancelar</button><button className="btn danger-button" onClick={()=>{setChildren(previous=>previous.filter(c=>c.id!==modal.remove.id));setModal(null);notify('Cadastro removido.');}}>Remover criança</button></div></Modal>}
-  </div>;
+
+  async function calculateRoute() {
+    if (!origin || !destination) {
+      setNotice('Confirme a origem e o destino antes de calcular a rota.');
+      return;
+    }
+    await requestRoute([origin, destination], 'Rota pronta. Ative o GPS para acompanhar sua posição real no trajeto.');
+  }
+
+  async function recalculateFromCurrentPosition() {
+    if (!position || !destination) {
+      setNotice('Ative o GPS e confirme um destino antes de recalcular.');
+      return;
+    }
+    const current = {
+      address: 'Minha localização atual',
+      lat: position.lat,
+      lng: position.lng,
+    };
+    setOrigin(current);
+    await requestRoute([current, destination], 'Rota atualizada a partir da sua localização real.');
+  }
+
+  function startTracking() {
+    setGeoError('');
+    setNotice('');
+
+    if (!navigator.geolocation) {
+      setGeoError('Este navegador não oferece suporte à geolocalização.');
+      return;
+    }
+
+    if (!window.isSecureContext && window.location.hostname !== 'localhost') {
+      setGeoError('A localização real exige HTTPS. Abra o projeto por HTTPS ou use localhost durante o desenvolvimento.');
+      return;
+    }
+
+    if (watchId.current !== null) return;
+
+    watchId.current = navigator.geolocation.watchPosition(
+      result => {
+        const next = {
+          lat: result.coords.latitude,
+          lng: result.coords.longitude,
+        };
+        setPosition(next);
+        setAccuracy(Number.isFinite(result.coords.accuracy) ? result.coords.accuracy : null);
+        setSpeed(Number.isFinite(result.coords.speed) ? result.coords.speed : null);
+        setHeading(Number.isFinite(result.coords.heading) ? result.coords.heading : null);
+        setLastFix(result.timestamp || Date.now());
+        setGeoError('');
+        setTracking(true);
+      },
+      error => {
+        setGeoError(getGeoMessage(error));
+        setTracking(false);
+        if (watchId.current !== null) {
+          navigator.geolocation.clearWatch(watchId.current);
+          watchId.current = null;
+        }
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 20000,
+        maximumAge: 3000,
+      }
+    );
+    setTracking(true);
+  }
+
+  function stopTracking() {
+    if (watchId.current !== null && navigator.geolocation) {
+      navigator.geolocation.clearWatch(watchId.current);
+    }
+    watchId.current = null;
+    setTracking(false);
+  }
+
+  return (
+    <div className="lumio-app">
+      <header className="app-header">
+        <a href="/" className="brand" aria-label="Lumio">
+          <span className="brand-mark"><BusFront size={22} /></span>
+          <span>lumio<span className="brand-dot">.</span></span>
+        </a>
+        <div className="header-status">
+          <span className={`status-dot ${tracking ? 'online' : ''}`} />
+          {tracking ? 'GPS ativo' : 'GPS desligado'}
+        </div>
+      </header>
+
+      <main className="page-shell">
+        <section className="hero-copy">
+          <div>
+            <span className="eyebrow">ACOMPANHAMENTO REAL</span>
+            <h1>{publicView ? 'Sua rota, acompanhada pelo dispositivo.' : 'Veja o trajeto acontecer de verdade.'}</h1>
+            <p>
+              Defina origem e destino, calcule o caminho e acompanhe a posição real deste dispositivo pelo GPS do navegador.
+            </p>
+          </div>
+          <div className="privacy-chip"><ShieldCheck size={16} /> GPS controlado pelo navegador</div>
+        </section>
+
+        <section className="tracker-layout">
+          <aside className="control-panel card">
+            <div className="panel-heading">
+              <div>
+                <span className="section-label">ROTA</span>
+                <h2>Defina o trajeto</h2>
+              </div>
+              <Route size={21} />
+            </div>
+
+            <AddressField label="Origem" value={origin} onChange={setOrigin} allowGps />
+            <AddressField label="Destino" value={destination} onChange={setDestination} />
+
+            <button className="btn primary full" onClick={calculateRoute} disabled={routeBusy || !origin || !destination}>
+              {routeBusy ? <LoaderCircle className="spin" size={17} /> : <Navigation size={17} />}
+              {routeBusy ? 'Calculando rota' : 'Calcular rota'}
+            </button>
+
+            <div className="tracking-box">
+              <div className="tracking-copy">
+                <div className={`tracking-icon ${tracking ? 'active' : ''}`}><LocateFixed size={19} /></div>
+                <div>
+                  <strong>Localização do dispositivo</strong>
+                  <span>{tracking ? 'Atualizando em tempo real' : 'Use o GPS para mover o marcador real'}</span>
+                </div>
+              </div>
+              {!tracking ? (
+                <button className="btn secondary full" onClick={startTracking}>
+                  <Crosshair size={17} /> Ativar GPS
+                </button>
+              ) : (
+                <button className="btn danger full" onClick={stopTracking}>
+                  <Square size={15} /> Parar acompanhamento
+                </button>
+              )}
+            </div>
+
+            {tracking && position && destination && (
+              <button className="btn ghost full" onClick={recalculateFromCurrentPosition} disabled={routeBusy}>
+                <RefreshCw size={16} className={routeBusy ? 'spin' : ''} /> Recalcular daqui
+              </button>
+            )}
+
+            {geoError && <div className="message error"><AlertTriangle size={17} /><span>{geoError}</span></div>}
+            {notice && <div className="message"><ShieldCheck size={17} /><span>{notice}</span></div>}
+
+            <div className="secure-note">
+              <Smartphone size={17} />
+              <p>No celular, aceite a permissão de localização. Em produção, geolocalização funciona em HTTPS. Ao calcular a rota, os pontos são enviados ao serviço de rotas.</p>
+            </div>
+          </aside>
+
+          <section className="map-card card">
+            <div className="map-toolbar">
+              <div>
+                <span className="section-label">MAPA AO VIVO</span>
+                <h2>{tracking ? 'Acompanhando seu dispositivo' : routeData ? 'Rota calculada' : 'Aguardando rota'}</h2>
+              </div>
+              <button className={`follow-toggle ${follow ? 'active' : ''}`} onClick={() => setFollow(value => !value)}>
+                <Crosshair size={15} /> {follow ? 'Seguindo GPS' : 'Mapa livre'}
+              </button>
+            </div>
+
+            <div className="map-frame">
+              <RouteMap
+                path={routeData?.path || []}
+                stops={routeStops}
+                position={position}
+                accuracy={accuracy}
+                follow={follow && tracking}
+                mapId="live-device-route"
+              />
+              <div className="map-overlay-status">
+                <span className={`live-pulse ${tracking ? 'active' : ''}`} />
+                <div>
+                  <strong>{tracking ? 'Posição real' : 'GPS não iniciado'}</strong>
+                  <span>{tracking ? 'Atualizada pelo navegador' : 'Ative o GPS para acompanhar'}</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="metrics-grid">
+              <Metric icon={Route} label="Distância da rota" value={routeData ? formatDistance(routeData.distance) : '--'} />
+              <Metric icon={Clock3} label="Tempo estimado" value={routeData ? formatDuration(routeData.duration) : '--'} />
+              <Metric icon={Gauge} label="Velocidade GPS" value={speed !== null ? `${Math.max(0, speed * 3.6).toFixed(1)} km/h` : '--'} />
+              <Metric icon={Crosshair} label="Precisão" value={accuracy !== null ? `± ${Math.round(accuracy)} m` : '--'} />
+            </div>
+          </section>
+        </section>
+
+        <section className="live-summary card">
+          <div className="summary-main">
+            <div className="summary-icon"><MapPin size={22} /></div>
+            <div>
+              <span className="section-label">PROGRESSO REAL</span>
+              <h2>{offRoute ? 'Você está fora do traçado calculado.' : tracking && routeData ? 'Sua posição está sendo comparada com a rota.' : 'Ative o GPS para medir o progresso.'}</h2>
+              <p>
+                {destinationDistance !== null
+                  ? `Distância em linha reta até o destino: ${formatDistance(destinationDistance)}.`
+                  : 'O progresso só muda quando a localização do dispositivo muda.'}
+              </p>
+            </div>
+          </div>
+
+          <div className="progress-panel">
+            <div className="progress-head">
+              <span>Progresso aproximado</span>
+              <strong>{tracking && routeData ? `${Math.round(routeMatch.progress * 100)}%` : '--'}</strong>
+            </div>
+            <div className="progress-track"><span style={{ width: `${tracking && routeData ? routeMatch.progress * 100 : 0}%` }} /></div>
+            <div className="progress-meta">
+              <span>{tracking && routeData ? `${formatDistance(remainingDistance)} restantes na rota` : 'Sem dados de rota ao vivo'}</span>
+              <span>{tracking && routeData ? `aprox. ${formatDuration(remainingDuration)}` : lastFix ? new Date(lastFix).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'Aguardando GPS'}</span>
+            </div>
+          </div>
+        </section>
+
+        <footer className="page-footer">
+          <span>lumio<span className="brand-dot">.</span></span>
+          <span>Rota calculada por endereços. Movimento exibido somente pela localização real do dispositivo.</span>
+        </footer>
+      </main>
+    </div>
+  );
 }
-function Stat({ icon:Icon,title,value,detail,color }) { return <div className="card stat-card"><div className="stat-top"><span>{title}</span><span className={`stat-icon ${color}`}><Icon size={19}/></span></div><strong className="stat-value">{value}</strong><p>{detail}</p></div>; }
+
+function Metric({ icon: Icon, label, value }) {
+  return (
+    <div className="metric">
+      <span className="metric-icon"><Icon size={17} /></span>
+      <div><span>{label}</span><strong>{value}</strong></div>
+    </div>
+  );
+}

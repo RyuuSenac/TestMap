@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "installCommand": "npm ci",
+  "buildCommand": "npm run build",
+  "functions": {
+    "app/api/geocode/route.js": { "maxDuration": 30 },
+    "app/api/route/route.js": { "maxDuration": 30 }
+  }
+}
